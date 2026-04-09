@@ -1,0 +1,131 @@
+name: CI Node API + WebSocket
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v5
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm install
+
+      - name: Verificar sintaxe do arquivo principal
+        run: node --check server.js
+
+      - name: Rodar testes do projeto
+        run: npm test
+
+      - name: Subir servidor em segundo plano
+        run: |
+          node server.js > server.log 2>&1 &
+          echo $! > server.pid
+          sleep 5
+
+      - name: Testar login e salvar token
+        run: |
+          RESPONSE=$(curl -s -X POST http://localhost:3000/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"adminpass"}')
+
+          echo "Resposta do login:"
+          echo "$RESPONSE"
+
+          TOKEN=$(node -e "const r = JSON.parse(process.argv[1]); if (!r.token) process.exit(1); console.log(r.token);" "$RESPONSE")
+
+          echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Testar conexão WebSocket autenticada
+        run: |
+          node <<'NODE'
+          const WebSocket = require('ws');
+
+          const token = process.env.TOKEN;
+          if (!token) {
+            console.error('Token não encontrado');
+            process.exit(1);
+          }
+
+          const ws = new WebSocket(`ws://localhost:3000/?token=${token}`);
+
+          const timeout = setTimeout(() => {
+            console.error('Timeout no teste WebSocket');
+            process.exit(1);
+          }, 10000);
+
+          let etapa = 0;
+
+          ws.on('open', () => {
+            console.log('WebSocket conectado');
+          });
+
+          ws.on('message', (data) => {
+            try {
+              const msg = JSON.parse(data.toString());
+              console.log('Mensagem recebida:', msg);
+
+              if (etapa === 0) {
+                if (!msg.mensagem || !msg.mensagem.includes('Conectado com sucesso')) {
+                  console.error('Falha na autenticação WebSocket');
+                  process.exit(1);
+                }
+
+                etapa = 1;
+                ws.send(JSON.stringify({ tipo: 'monitorar_salas' }));
+                return;
+              }
+
+              if (etapa === 1) {
+                clearTimeout(timeout);
+
+                if (msg.mensagem !== 'Admin autorizado a monitorar salas') {
+                  console.error('Resposta inesperada ao comando admin');
+                  process.exit(1);
+                }
+
+                console.log('Teste WebSocket concluído com sucesso');
+                ws.close();
+                process.exit(0);
+              }
+            } catch (error) {
+              console.error('Erro ao processar mensagem WebSocket:', error.message);
+              process.exit(1);
+            }
+          });
+
+          ws.on('error', (err) => {
+            clearTimeout(timeout);
+            console.error('Erro no WebSocket:', err.message);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Mostrar log do servidor se falhar
+        if: failure()
+        run: |
+          if [ -f server.log ]; then
+            cat server.log
+          else
+            echo "server.log não foi criado"
+          fi
+
+      - name: Encerrar servidor
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) || true
+          fi
+
